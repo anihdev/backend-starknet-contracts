@@ -8,7 +8,7 @@ mod teams {
 
 mod tournaments {
     mod TournamentComponent;
-    mod TournamentEvents; 
+    mod TournamentEvents;
     mod TournamentSystem;
 }
 

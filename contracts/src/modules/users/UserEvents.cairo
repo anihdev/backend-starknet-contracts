@@ -1,1 +1,1 @@
-# Gestión de equipos
+// # Gestión de equipos

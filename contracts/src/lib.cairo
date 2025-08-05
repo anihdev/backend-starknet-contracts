@@ -11,4 +11,5 @@ pub mod modules {
 #[cfg(test)]
 mod tests {
     mod test_betting;
+    mod test_place_bet;
 }

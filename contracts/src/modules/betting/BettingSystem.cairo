@@ -1,4 +1,6 @@
+use core::option::Option;
 use starknet::ContractAddress;
+
 
 // ========================================
 // CONTRACT INTERFACE - Betting System
@@ -6,10 +8,7 @@ use starknet::ContractAddress;
 
 #[starknet::interface]
 pub trait IBettingSystem<TContractState> {
-
-    fn get_active_bet_pools(
-        self: @TContractState,
-    ) -> Array<BetPool>; 
+    fn get_active_bet_pools(self: @TContractState) -> Array<BetPool>;
 
     fn create_bet_pool(
         ref self: TContractState,
@@ -27,6 +26,11 @@ pub trait IBettingSystem<TContractState> {
     fn get_total_pools(self: @TContractState) -> u64;
     fn get_pool_by_id(self: @TContractState, pool_id: u64) -> BetPool;
     fn get_owner(self: @TContractState) -> ContractAddress;
+    fn place_bet(ref self: TContractState, pool_id: u64, predicted_outcome: felt252, amount: u256);
+
+    fn get_bet_details(
+        self: @TContractState, bettor: ContractAddress, pool_id: u64,
+    ) -> Option<BetDetails>;
 }
 
 // ========================================
@@ -74,9 +78,10 @@ pub struct PoolStatus {
 #[starknet::contract]
 pub mod BettingSystem {
     use core::num::traits::Zero;
+    use core::option::Option;
     use starknet::storage::*;
     use starknet::{ContractAddress, get_block_timestamp, get_caller_address};
-    use super::{BetPool, IBettingSystem, PoolStatus};
+    use super::{BetDetails, BetPool, IBettingSystem, PoolStatus};
 
     // Contract storage
     #[storage]
@@ -93,6 +98,10 @@ pub mod BettingSystem {
         outcomes_per_pool: Map<u64, Vec<felt252>>,
         // Owner of the contract (new)
         owner: ContractAddress,
+        // bettor_address, pool_id > BetDetails
+        bets: Map<(ContractAddress, u64), BetDetails>,
+        // Track if a bettor has placed a bet in a specific pool
+        has_bet: Map<(ContractAddress, u64), bool>,
     }
 
     #[event]
@@ -100,6 +109,18 @@ pub mod BettingSystem {
     pub enum Event {
         BetPoolCreated: BetPoolCreated,
         PoolClosed: PoolClosed,
+        BetPlaced: BetPlaced,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct BetPlaced {
+        #[key]
+        pub pool_id: u64,
+        #[key]
+        pub bettor: ContractAddress,
+        pub predicted_outcome: felt252,
+        pub amount: u256,
+        pub placed_at: u64,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -210,30 +231,28 @@ pub mod BettingSystem {
             pool_id
         }
 
-        fn get_active_bet_pools(
-            self: @ContractState,
-        ) -> Array<BetPool> {
+        fn get_active_bet_pools(self: @ContractState) -> Array<BetPool> {
             let mut active_pools = ArrayTrait::new();
             let active_ids_len = self.active_pool_ids.len();
-            
+
             let mut i = 0;
             loop {
                 if i >= active_ids_len {
                     break;
                 }
-                
+
                 let pool_id = self.active_pool_ids.at(i).read();
                 let pool = self.pools.read(pool_id);
                 let status = self.pool_status.read(pool_id);
-                
+
                 // Filter by is_open == true as required
                 if pool.is_open && status.is_active {
                     active_pools.append(pool);
                 }
-                
+
                 i += 1;
-            };
-            
+            }
+
             active_pools
         }
 
@@ -252,6 +271,70 @@ pub mod BettingSystem {
         fn get_owner(self: @ContractState) -> ContractAddress {
             self.owner.read()
         }
+        fn place_bet(
+            ref self: ContractState, pool_id: u64, predicted_outcome: felt252, amount: u256,
+        ) {
+            let caller = get_caller_address();
+            let current_timestamp = get_block_timestamp();
+
+            // Validate pool exists and is open
+            assert(pool_id > 0, 'INVALID_POOL_ID');
+            let mut pool = self.pools.read(pool_id);
+            assert(pool.pool_id != 0, 'POOL_NOT_EXISTS');
+            assert(pool.is_open, 'POOL_NOT_OPEN');
+            assert(current_timestamp < pool.closes_at, 'POOL_CLOSED');
+
+            // Validate bet amount
+            assert(amount >= pool.min_bet, 'BET_TOO_LOW');
+            assert(amount <= pool.max_bet, 'BET_TOO_HIGH');
+            assert(amount > 0, 'INVALID_BET_AMOUNT');
+
+            // Prevent multiple bets from same address in same pool
+            let bet_key = (caller, pool_id);
+            assert(!self.has_bet.read(bet_key), 'ALREADY_PLACED_BET');
+
+            // Validate outcome exists for this pool
+            self._validate_outcome_exists(pool_id, predicted_outcome);
+
+            // Create bet details
+            let bet_details = BetDetails {
+                bettor: caller, pool_id, predicted_outcome, amount, placed_at: current_timestamp,
+            };
+
+            // Store the bet
+            self.bets.write(bet_key, bet_details);
+            self.has_bet.write(bet_key, true);
+
+            // Update pool statistics
+            pool.total_amount += amount;
+            pool.total_bets += 1;
+            self.pools.write(pool_id, pool);
+
+            // Emit event
+            self
+                .emit(
+                    Event::BetPlaced(
+                        BetPlaced {
+                            pool_id,
+                            bettor: caller,
+                            predicted_outcome,
+                            amount,
+                            placed_at: current_timestamp,
+                        },
+                    ),
+                );
+        }
+
+        fn get_bet_details(
+            self: @ContractState, bettor: ContractAddress, pool_id: u64,
+        ) -> Option<BetDetails> {
+            let bet_key = (bettor, pool_id);
+            if self.has_bet.read(bet_key) {
+                Option::Some(self.bets.read(bet_key))
+            } else {
+                Option::None
+            }
+        }
     }
 
     #[generate_trait]
@@ -260,6 +343,28 @@ pub mod BettingSystem {
             let owner = self.owner.read();
             let caller = get_caller_address();
             assert(caller == owner, 'CALLER_NOT_OWNER');
+        }
+        fn _validate_outcome_exists(self: @ContractState, pool_id: u64, outcome: felt252) {
+            let outcomes_vec = self.outcomes_per_pool.entry(pool_id);
+            let outcomes_len = outcomes_vec.len();
+            let mut found = false;
+            let mut i = 0;
+
+            loop {
+                if i >= outcomes_len {
+                    break;
+                }
+
+                let stored_outcome = outcomes_vec.at(i).read();
+                if stored_outcome == outcome {
+                    found = true;
+                    break;
+                }
+
+                i += 1;
+            }
+
+            assert(found, 'INVALID_OUTCOME');
         }
     }
 }
